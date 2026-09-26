@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,14 +52,24 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    # NFKC makes visually equivalent Unicode consistent; format characters
+    # include zero-width spaces commonly used to split dangerous phrases.
+    normalized = unicodedata.normalize("NFKC", user_input)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"\bignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?\b",
+        r"\byou\s+are\s+now\b",
+        r"\bsystem\s+prompt\b",
+        r"\breveal\s+(?:your\s+)?(?:instructions?|prompt)\b",
+        r"\bpretend\s+(?:that\s+)?you\s+are\b",
+        r"\bact\s+as\s+(?:an?\s+)?unrestricted\b",
+        r"\b(disregard|override|bypass)\s+(?:all\s+)?(?:previous\s+)?instructions?\b",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +95,37 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Config stores Vietnamese keywords without accents.  Fold accents so a
+    # normal customer phrase such as "chuyển khoản" still matches it.
+    input_lower = "".join(
+        ch
+        for ch in unicodedata.normalize("NFD", user_input.lower())
+        if unicodedata.category(ch) != "Mn"
+    )
+    allowed_topics = [
+        "".join(
+            ch
+            for ch in unicodedata.normalize("NFD", topic.lower())
+            if unicodedata.category(ch) != "Mn"
+        )
+        for topic in ALLOWED_TOPICS
+    ]
+    blocked_topics = [
+        "".join(
+            ch
+            for ch in unicodedata.normalize("NFD", topic.lower())
+            if unicodedata.category(ch) != "Mn"
+        )
+        for topic in BLOCKED_TOPICS
+    ]
+    # A common Vietnamese spelling of the configured "chuyen tien" topic.
+    allowed_topics.append("chuyen khoan")
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    if any(topic in input_lower for topic in blocked_topics):
+        return "BLOCK"
+    if not any(topic in input_lower for topic in allowed_topics):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +178,18 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
-
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I can't follow instructions that attempt to change my safety rules. "
+                "Please ask a banking-related question."
+            )
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I can only help with safe, banking-related questions."
+            )
+        return None
 
 
 # ============================================================
